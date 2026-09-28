@@ -27,6 +27,12 @@ export PIPEASIO_SAMPLE_RATE='48000'
 # Not needed for PipeASIO - kept for reference. To be removed in the future.
 # export PIPEWIRE_LATENCY="${PIPEASIO_PREFERRED_BUFFERSIZE}/${PIPEASIO_SAMPLE_RATE}"
 
+# LACT (Linux AMDGPU Controller) profile configurations.
+# Set LACT_GAME_PROFILE to your preferred overclock/undervolt profile for playing.
+# Set LACT_IDLE_PROFILE to the profile you want to return to when closing the game.
+LACT_GAME_PROFILE='game'
+LACT_IDLE_PROFILE='idle'
+
 # Steam's default library, where Steam itself and its compat tools are
 # installed. This is not necessarily where the game itself lives.
 STEAM_HOME="${HOME}/.local/share/Steam"
@@ -79,40 +85,74 @@ export STEAM_COMPAT_DATA_PATH="${STEAMAPPS}/compatdata/${APP}"
 export SteamClientLaunch='1'
 export SteamEnv='1'
 
-# PipeWire's daemon-wide forced quantum/rate (clock.force-quantum/force-rate in
-# the "settings" metadata, e.g. set by the Cable app) overrides any per-app
-# request, including PipeASIO's. Pin it to match PIPEASIO_PREFERRED_BUFFERSIZE/
-# PIPEASIO_SAMPLE_RATE above so they actually take effect, and restore
-# whatever was set before on exit.
+# ============================================================
+#  RESTORE SYSTEM SETTINGS
+# ============================================================
 ORIG_FORCE_QUANTUM=''
 ORIG_FORCE_RATE=''
-restore_pipewire_clock() {
-    if [[ -n "${ORIG_FORCE_QUANTUM}" ]]; then
-        pw-metadata -n settings 0 clock.force-quantum "${ORIG_FORCE_QUANTUM}" >/dev/null || true
-    else
-        pw-metadata -n settings -d 0 clock.force-quantum >/dev/null || true
+LACT_PROFILE_CHANGED=false
+
+restore_system_settings() {
+    echo "Cleaning up and restoring system profiles..."
+
+    # 1. Restore PipeWire Clock Settings
+    if command -v pw-metadata >/dev/null; then
+        if [[ -n "${ORIG_FORCE_QUANTUM}" ]]; then
+            pw-metadata -n settings 0 clock.force-quantum "${ORIG_FORCE_QUANTUM}" >/dev/null || true
+        else
+            pw-metadata -n settings -d 0 clock.force-quantum >/dev/null || true
+        fi
+
+        if [[ -n "${ORIG_FORCE_RATE}" ]]; then
+            pw-metadata -n settings 0 clock.force-rate "${ORIG_FORCE_RATE}" >/dev/null || true
+        else
+            pw-metadata -n settings -d 0 clock.force-rate >/dev/null || true
+        fi
     fi
-    if [[ -n "${ORIG_FORCE_RATE}" ]]; then
-        pw-metadata -n settings 0 clock.force-rate "${ORIG_FORCE_RATE}" >/dev/null || true
-    else
-        pw-metadata -n settings -d 0 clock.force-rate >/dev/null || true
+
+    # 2. Restore LACT GPU Overclocking Profile
+    if [[ "${LACT_PROFILE_CHANGED}" = true ]] && command -v lact >/dev/null; then
+        lact cli profile set "${LACT_IDLE_PROFILE}" >/dev/null
+        echo "LACT overclocking profile ${LACT_IDLE_PROFILE} set"
     fi
 }
+
+# Single unified trap for all exits/signals
+trap restore_system_settings EXIT
+
+# ============================================================
+#  APPLY SYSTEM SETTINGS
+# ============================================================
+
+# Set up PipeWire pinning
 if command -v pw-metadata >/dev/null; then
-    ORIG_FORCE_QUANTUM=$(pw-metadata -n settings 0 clock.force-quantum 2>/dev/null | sed -n "s/.*value:'\([^']*\)'.*/\1/p")
-    ORIG_FORCE_RATE=$(pw-metadata -n settings 0 clock.force-rate 2>/dev/null | sed -n "s/.*value:'\([^']*\)'.*/\1/p")
-    trap restore_pipewire_clock EXIT
+    # Improved sed regex: matches value:'123', value:"123", or value:123
+    ORIG_FORCE_QUANTUM=$(pw-metadata -n settings 0 clock.force-quantum 2>/dev/null | sed -n "s/.*value:['\"]*\([^'\"]*\)['\"]*.*/\1/p")
+    ORIG_FORCE_RATE=$(pw-metadata -n settings 0 clock.force-rate 2>/dev/null | sed -n "s/.*value:['\"]*\([^'\"]*\)['\"]*.*/\1/p")
+
+    # If the current value is explicitly "0" (auto), treat it as an empty/unset state
+    [[ "${ORIG_FORCE_QUANTUM}" == "0" ]] && ORIG_FORCE_QUANTUM=""
+    [[ "${ORIG_FORCE_RATE}" == "0" ]] && ORIG_FORCE_RATE=""
+
     pw-metadata -n settings 0 clock.force-quantum "${PIPEASIO_PREFERRED_BUFFERSIZE}" >/dev/null
     pw-metadata -n settings 0 clock.force-rate "${PIPEASIO_SAMPLE_RATE}" >/dev/null
 else
     >&2 echo 'Warning: pw-metadata not found; cannot pin PipeWire'\''s daemon-wide quantum/rate.'
 fi
 
-# Launch the game through the runtime and Proton, from its own directory.
-# Not exec'd: the EXIT trap above must run after the game exits to restore
-# PipeWire's clock settings.
+# Set up LACT GPU profile
+if command -v lact >/dev/null; then
+    lact cli profile set "${LACT_GAME_PROFILE}" >/dev/null
+    echo "LACT overclocking profile ${LACT_GAME_PROFILE} set"
+    LACT_PROFILE_CHANGED=true
+fi
+
+# ============================================================
+#  LAUNCH THE GAME
+# ============================================================
+
 LAUNCH_CMD=(
-  env --chdir="${GAME_DIR}" \
+    env --chdir="${GAME_DIR}" \
     "${STEAM_RUNTIME_LAUNCHER}" \
     container-runtime "${PROTON_BIN}" \
     waitforexitandrun "${GAME_DIR}/${GAME}.exe" -uplay_steam_mode
@@ -124,4 +164,5 @@ if command -v game-performance >/dev/null; then
     LAUNCH_CMD=(game-performance "${LAUNCH_CMD[@]}")
 fi
 
+# Execute the final built command array
 "${LAUNCH_CMD[@]}"
