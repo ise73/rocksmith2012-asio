@@ -1,93 +1,81 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/rocksmith-on-linux-logo-plain-dark.svg">
-    <img alt="Rocksmith on Linux" src="docs/assets/rocksmith-on-linux-logo-plain-light.svg" width="500">
-  </picture>
-</p>
+# Rocksmith (2011) ASIO — no Real Tone Cable needed
 
-*Rocksmith on Linux* is a patch that adds ASIO support to Ubisoft's **Rocksmith**, allowing the game to be run on Linux using Proton, PipeWire and an ASIO driver for Wine.
+An ASIO patch for Ubisoft's original **Rocksmith** (2011/2012, Steam version) on **Windows**.
+It lets the game use any ASIO audio interface for both guitar input and game audio output,
+**with or without the Real Tone Cable**, and with much lower latency than the stock WASAPI setup.
 
-This project is a fork of [RS ASIO](https://github.com/mdias/rs_asio), by Micael Dias, modified to work on Rocksmith. Rocksmith is different from *Rocksmith 2014* in how it handles audio, and the original RS ASIO mod doesn't work with it. 
+It is based on [rocksmith-on-linux](https://github.com/ferabreu/rocksmith-on-linux) by ferabreu,
+which is itself a fork of [RS ASIO](https://github.com/mdias/rs_asio) by Micael Dias.
+Linux/Proton users: the Linux setup is still supported, see [docs/README.md](docs/README.md).
 
-Using Ubisoft's Real Tone Cable is still required. Rocksmith does not work without it. Because of that, the only practical purpose of this mod is to allow the game to run on Linux with low latency and good performance.
+## What it does
 
-In my experience, using this patch while running the game on a relatively modern Linux system makes it playable as if it were running on Windows. On a modern machine, PipeWire makes it possible to get really low latency and redirect the audio output in useful/creative ways, like for recording or listening to your playing's "raw tone" (this is especially useful, since Rocksmith makes your tone better than it would sound in a real live scenario).
+- **Output:** game audio goes to your ASIO interface.
+- **Input:** guitar is read from an ASIO input channel.
+- **No cable:** with `EmulateRealToneCable=1` the ASIO input is presented to the game as a
+  Real Tone Cable. If a real cable is plugged in, emulation switches itself off and the
+  cable's input is redirected to ASIO instead (as in rocksmith-on-linux).
+- **Low latency:** Rocksmith 2011 polls the audio device about every 10 ms. A ring buffer
+  between the game and ASIO lets the driver run with small buffers (128–256 samples)
+  without crackling.
 
+Tested with: Steam Rocksmith (exe CRC32 `0xe0f686e0`), Windows 11 LTSC, Steinberg UR12.
 
-## How to use
+## Installation
 
-### Requirements
+1. Download the latest build: open the
+   [Actions page](../../actions/workflows/build.yml), pick the newest successful run of the
+   `windows-port`/`main` branch and download the archive under **Artifacts**
+   (or use a release, once there is one).
+2. Copy `avrt.dll` and `RS_ASIO.dll` into the game folder (next to `Rocksmith.exe`).
+3. Copy `RS_ASIO-windows.ini` there too and **rename it to `RS_ASIO.ini`**.
+4. Edit `RS_ASIO.ini`:
+   - `Driver=` in `[Asio.Output]` and `[Asio.Input.0]`: the exact name of your ASIO driver.
+     If unsure, start the game once and look for `AsioHelpers::FindDrivers` in `RS_ASIO.log`.
+   - `Channel=` in `[Asio.Input.0]`: the input your guitar is plugged into, counting from 0
+     (e.g. on a Steinberg UR12 the Hi-Z guitar input is `1`).
+5. In `Rocksmith.ini` make sure the `[Audio]` section has `ExclusiveMode=1`.
+6. In your ASIO driver's control panel set the buffer size to **128** or **256** samples.
 
-- The original Ubisoft/Hercules *Real Tone Cable* (also known as *Rocksmith USB Guitar Adapter*).
-- A Linux-based OS correctly configured, including:
-  - PipeWire
-  - [PipeASIO](https://github.com/M0n7y5/pipeasio), which talks to PipeWire directly and does not need JACK or the `pipewire-jack` module (only required if you use WineASIO instead)
-  - Steam (and Proton)
-- Steam's version of Rocksmith installed and [correctly set up](docs/setup-guide.md).
+To uninstall, delete `avrt.dll`, `RS_ASIO.dll`, `RS_ASIO.ini` and `RS_ASIO.log` from the game folder.
 
-From version 0.7.5-rs1.1 onwards, I'm focusing on running the game with PipeWire and PipeASIO — this setup has [made the whole configuration process much easier](docs/setup-guide.md) for me, when running both Rocksmith and Rocksmith 2014.
+## Configuration reference (Rocksmith 2011 specific)
 
-I have tested only the Steam version of Rocksmith — so I cannot assume other versions will work.
+| Section | Key | Default | Meaning |
+|---|---|---|---|
+| `[Asio.Input.N]` | `EmulateRealToneCable` | `0` | `1` = show this ASIO input to the game as a Real Tone Cable. Ignored while a real cable is connected. |
+| `[Asio.Input.N]` | `WasapiDevice` | — | With a real cable: name/ID of the WASAPI device to redirect to this ASIO input. `Rocksmith` matches the cable. |
+| `[Asio]` | `EnablePollingRingBuffer` | `1` | Ring buffer between game and ASIO. `0` = old behaviour (needs a 512-sample driver buffer). |
+| `[Asio]` | `PollingBufferSize` | auto | Ring buffer size in samples. Smaller = less latency; too small = crackling. `512` works well at a 128-sample driver buffer. |
+| `[Config]` | `DiagnosticLog` | `0` | `1` = log the game's low-level device calls. Only for troubleshooting. |
 
-### Installation
+All other keys work as in [RS ASIO](https://github.com/mdias/rs_asio).
 
-- Copy the files `avrt.dll`, `RS_ASIO.dll`, `RS_ASIO.ini` and `rocksmith-on-linux.sh` from the [latest release](https://github.com/ferabreu/rocksmith-on-linux/releases/latest) (zip archive rocksmith-on-linux-\<VERSION\>.zip) to the game folder.
-  - The `RS_ASIO.ini` file is pre-configured to be used with the recommended environment.
+## Troubleshooting
 
-### Configuration
+- **Crackling:** increase the driver buffer (256), or set `PollingBufferSize=768`/`1024`.
+  `RS_ASIO.log` shows `polling FIFO underrun` lines when this happens.
+- **"Too many instruments connected":** you are on an old build; update. Current builds
+  disable cable emulation while a real cable is plugged in.
+- **Game asks for the cable:** check that `EmulateRealToneCable=1` is in the input section
+  and that `RS_ASIO.log` contains `will be presented to the game as a Real Tone Cable`.
+- **No guitar sound:** check `Channel=` and the input gain on your interface.
 
-Check the [setup guide](docs/setup-guide.md) — it also covers running *Rocksmith 2014* with [RS ASIO](https://github.com/mdias/rs_asio).
+## How it works (short)
 
-### Removal
+The DLL is loaded through a proxy `avrt.dll` and patches the game's import address table.
+WASAPI device enumeration is replaced so the game sees ASIO-backed devices.
+To recognise the cable the game (1) inspects capture endpoints with form factor *Microphone*
+for a property containing `VID_12BA&PID_00FF`, and (2) scans `KSCATEGORY_AUDIO` with SetupAPI.
+Emulation answers both: the ASIO input reports the cable's form factor, name and USB ID, and
+a synthetic cable interface is appended to the SetupAPI scan (its KS handle is a NUL device;
+the game tolerates failed KS queries). Details: [docs/tech-details.md](docs/tech-details.md).
 
-- Remove the copied files (and `RS_ASIO.log`) from the game folder.
+## Credits
 
+- [RS ASIO](https://github.com/mdias/rs_asio) — Micael Dias
+- [rocksmith-on-linux](https://github.com/ferabreu/rocksmith-on-linux) — ferabreu
+- Windows port, ring buffer and cable emulation: ise73, with Claude (Anthropic)
 
-## Known issues
-
-- Only works with the original Ubisoft/Hercules *Real Tone Cable* (also known as *Rocksmith USB Guitar Adapter*).
-- 32-bit game, 32-bit problems. PipeASIO simplifies this greatly, because it allows using Windows' SysWOW64 under Proton versions that support it. Check the [setup guide](docs/setup-guide.md).
-- Hardware hotplugging while the game is running won't be noticed by the game.
-- Sometimes, the game will not start. That's probably a momentary issue. Just try again and it should work.
-- I'll attempt to follow the upstream RS ASIO versioning scheme and bring its improvements to this fork. However, because of the local changes, not all updates will be applicable/carried over.
-  
-
-## Disclaimer
-
-**Testing and Limitations:**
-- I made this software for my personal use.
-- I tested this software only for me. It has not been exhaustively tested.
-- Basic functionality has been verified:
-  - with a single Real Tone Cable
-  - in a single Linux environment based on CachyOS Linux, using Steam/Proton, PipeWire, and PipeASIO.
-- It may not work in all possible environments and configurations.
-
-**No Warranty:**
-- This software is provided as-is without any warranty of any kind, express or implied.
-- The authors are not responsible for any problems, damages, data loss, or other issues arising from the use of this software.
-- Use at your own risk.
-
-**Legal Notice:**
-- *Rocksmith* and *Rocksmith 2014* are trademarks and properties of Ubisoft.
-- This project is an independent effort and is not affiliated with, endorsed by, or approved by Ubisoft.
-- The logo displayed above is a modified version of the original Rocksmith logo, created by Ubisoft, and is used here for informational purposes only, to indicate that the project is related to Rocksmith. The logo and branding are protected and cannot be used for commercial purposes without authorization from Ubisoft.
-
-
-## Additional technical details
-
-Additional information about how *Rocksmith on Linux* works, and how to configure it, can be found in the [technical details document](docs/tech-details.md). This includes information about how the WASAPI redirect works and how to match the `WasapiDevice` setting.
-
-I have also included a good portion of my "development conversations" with GitHub Copilot in [docs/copilot-sessions](docs/copilot-sessions):
-- [01-copilot-chat.md](docs/copilot-sessions/01-copilot-chat.md) covers the initial specifications I gave to Copilot, and the subsequent conversation where I asked for help with implementation details, debugging and testing (including a section on trying to replicate full ASIO support in Wine, which was ultimately unsuccessful).
-- [02-gpt53codex.md](docs/copilot-sessions/02-gpt53codex.md) and [03-cable-detect-failure.md](docs/copilot-sessions/03-cable-detect-failure.md) cover later sessions diagnosing and fixing cable-detection regressions caused by Wine/Proton updates.
-
-These may be interesting for those who want to understand how the project was developed, or how to use GitHub Copilot for similar projects.
-
-If you're on an older system still using PulseAudio, it may be possible to use the patch with WineASIO and JACK instead of PipeASIO/PipeWire. Proton's audio driver can be selected with the `WINE_AUDIO_DRIVER` environment variable (the default fallback list is `pipewire,pulse,alsa`) — setting it to `pulse` forces PulseAudio. This isn't an officially supported path, just a possibility worth mentioning. See the [technical details document](docs/tech-details.md) for the Proton/Wine specifics.
-
-
-## Credits & Acknowledgments
-
-This project is a fork of [RS ASIO](https://github.com/mdias/rs_asio), by Micael Dias, without which this project would not be possible. RS ASIO is still being maintained and developed, and I recommend checking it out if you want to use ASIO with Rocksmith 2014.
-
-Assisted by: Claude Sonnet 4.6/5 and Claude Haiku 4.5, GitHub Copilot.
+*Rocksmith* is a trademark of Ubisoft. This project is not affiliated with or endorsed by Ubisoft.
+MIT license, see [LICENSE](LICENSE).

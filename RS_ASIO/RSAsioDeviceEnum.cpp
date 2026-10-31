@@ -8,6 +8,7 @@
 #pragma comment(lib, "setupapi.lib")
 
 bool g_EmulateRealToneCable = false;
+bool g_DiagnosticLog = false;
 
 // True if a real Real Tone Cable (USB VID_12BA:PID_00FF) is currently plugged in.
 // Uses SetupAPI directly from this DLL, so the game's hooked IAT entries are not involved.

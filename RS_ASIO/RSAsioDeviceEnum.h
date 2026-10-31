@@ -34,6 +34,10 @@ struct RSAsioInputConfig
 // which then adds a fake Real Tone Cable entry to the game's SetupAPI/KS device scan.
 extern bool g_EmulateRealToneCable;
 
+// [Config] DiagnosticLog=1: log the game's low-level device calls (DeviceIoControl,
+// registry reads, ...). Only useful for development; makes the log much larger.
+extern bool g_DiagnosticLog;
+
 // Registry of WASAPI device ID → IMMDevice (ASIO-backed) for audio client redirect.
 // Populated by RSAsioDeviceEnum when WasapiDevice= is configured in RS_ASIO.ini.
 void RegisterWasapiRedirect(const std::wstring& wasapiDeviceSubId, IMMDevice* asioDevice);

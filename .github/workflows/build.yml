@@ -44,7 +44,8 @@ jobs:
         copy "bin\Win32\${{ env.BUILD_CONFIGURATION }}\avrt.dll" "$stagingName\"
         copy "assets\RS_ASIO.ini" "$stagingName\"
         copy "LICENSE" "$stagingName\"
-        copy "docs\README.md" "$stagingName\"
+        copy "README.md" "$stagingName\"
+        copy "docs\README.md" "$stagingName\README-linux.md"
         if (Test-Path "assets\RS_ASIO-windows.ini") { copy "assets\RS_ASIO-windows.ini" "$stagingName\" }
         if (Test-Path "assets\rocksmith-on-linux.sh") { copy "assets\rocksmith-on-linux.sh" "$stagingName\" }
         if (Test-Path "docs\setup-guide.md") { copy "docs\setup-guide.md" "$stagingName\" }

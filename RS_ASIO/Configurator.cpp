@@ -296,6 +296,10 @@ static void LoadConfigIni(RSConfig& out)
 							out.enableWasapiOutputs = out.enableWasapiInputs = v;
 						}
 					}
+					else if (key == "diagnosticlog")
+					{
+						parseBoolString(val, g_DiagnosticLog);
+					}
 					else if (key == "enableasio")
 					{
 						parseBoolString(val, out.enableAsioOutput);

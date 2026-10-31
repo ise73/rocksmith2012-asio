@@ -404,7 +404,7 @@ static LSTATUS WINAPI Diag_RegQueryValueExW(HKEY hKey, LPCWSTR name, LPDWORD res
 	if (pType) *pType = type;
 
 	static LONG s_count = 0;
-	if (InterlockedIncrement(&s_count) <= 300)
+	if (g_DiagnosticLog && InterlockedIncrement(&s_count) <= 300)
 	{
 		auto& log = rslog::info_ts();
 		log << "Diag_RegQueryValueExW key=" << hKey << " name=" << (name ? std::wstring(name) : std::wstring(L"(default)"))
@@ -480,7 +480,7 @@ static BOOL WINAPI Diag_DeviceIoControl(HANDLE h, DWORD code, LPVOID inBuf, DWOR
 	}
 
 	// limit spam: log the first 40 calls per handle+ioctl, then every 1000th
-	if (count <= 40 || (count % 1000) == 0)
+	if (g_DiagnosticLog && (count <= 40 || (count % 1000) == 0))
 	{
 		const DWORD returned = (ret && pReturned) ? *pReturned : 0;
 		rslog::info_ts() << "Diag_DeviceIoControl h=" << h
@@ -517,6 +517,12 @@ static BOOL WINAPI Diag_SetupDiGetDeviceRegistryPropertyW(HDEVINFO devs, PSP_DEV
 	const BOOL ret = s_Real_SetupDiGetDeviceRegistryPropertyW(devs, devInfo, prop, &regType, buf, bufSize, pRequired);
 	const DWORD gle = GetLastError();
 	if (pRegType) *pRegType = regType;
+
+	if (!g_DiagnosticLog)
+	{
+		SetLastError(gle);
+		return ret;
+	}
 
 	auto& log = rslog::info_ts();
 	log << "Diag_SetupDiGetDeviceRegistryPropertyW prop=" << std::dec << prop
