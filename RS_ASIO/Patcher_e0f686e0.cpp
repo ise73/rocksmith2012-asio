@@ -2,6 +2,10 @@
 #include "dllmain.h"
 #include "Patcher.h"
 #include <setupapi.h>
+#include <mmsystem.h>
+#include <dbt.h>
+#include <sstream>
+#include <map>
 
 // ---------------------------------------------------------------------------
 // SetupAPI and CreateFile diagnostic hooks (pass-through, logging only).
@@ -203,6 +207,209 @@ static bool IsFakeRsAsioCablePath(LPCWSTR path)
 	return wcsstr(lower, L"rs_asio") != nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Extra diagnostics (cable-free investigation): what does the game do with the
+// KS device handles it opens, which SetupAPI registry properties it reads, and
+// whether it touches the legacy waveIn API.
+// ---------------------------------------------------------------------------
+
+static const DWORD IAT_RVA_DeviceIoControl                    = 0x0088d070;
+static const DWORD IAT_RVA_SetupDiGetClassDevsW               = 0x0088d2bc;
+static const DWORD IAT_RVA_SetupDiGetDeviceRegistryPropertyW  = 0x0088d2c4;
+static const DWORD IAT_RVA_RegisterDeviceNotificationW        = 0x0088d3b0;
+static const DWORD IAT_RVA_waveInOpen                         = 0x0088d3e4;
+static const DWORD IAT_RVA_waveInGetNumDevs                   = 0x0088d3fc;
+static const DWORD IAT_RVA_waveInGetDevCapsA                  = 0x0088d400;
+
+typedef BOOL (WINAPI* PFN_DeviceIoControl)(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+typedef HDEVINFO (WINAPI* PFN_SetupDiGetClassDevsW)(const GUID*, PCWSTR, HWND, DWORD);
+typedef BOOL (WINAPI* PFN_SetupDiGetDeviceRegistryPropertyW)(HDEVINFO, PSP_DEVINFO_DATA, DWORD, PDWORD, PBYTE, DWORD, PDWORD);
+typedef HDEVNOTIFY (WINAPI* PFN_RegisterDeviceNotificationW)(HANDLE, LPVOID, DWORD);
+typedef MMRESULT (WINAPI* PFN_waveInOpen)(LPHWAVEIN, UINT, LPCWAVEFORMATEX, DWORD_PTR, DWORD_PTR, DWORD);
+typedef UINT (WINAPI* PFN_waveInGetNumDevs)(void);
+typedef MMRESULT (WINAPI* PFN_waveInGetDevCapsA)(UINT_PTR, LPWAVEINCAPSA, UINT);
+
+static PFN_DeviceIoControl                   s_Real_DeviceIoControl = nullptr;
+static PFN_SetupDiGetClassDevsW              s_Real_SetupDiGetClassDevsW = nullptr;
+static PFN_SetupDiGetDeviceRegistryPropertyW s_Real_SetupDiGetDeviceRegistryPropertyW = nullptr;
+static PFN_RegisterDeviceNotificationW       s_Real_RegisterDeviceNotificationW = nullptr;
+static PFN_waveInOpen                        s_Real_waveInOpen = nullptr;
+static PFN_waveInGetNumDevs                  s_Real_waveInGetNumDevs = nullptr;
+static PFN_waveInGetDevCapsA                 s_Real_waveInGetDevCapsA = nullptr;
+
+static std::mutex s_DiagHandleMutex;
+static std::map<HANDLE, std::wstring> s_DiagHandlePaths;
+static std::map<std::pair<HANDLE, DWORD>, unsigned> s_DiagIoctlCounts;
+
+static void DiagTrackDeviceHandle(HANDLE h, LPCWSTR path)
+{
+	if (h == INVALID_HANDLE_VALUE || !path || path[0] != L'\\' || path[1] != L'\\')
+		return;
+	std::lock_guard<std::mutex> g(s_DiagHandleMutex);
+	s_DiagHandlePaths[h] = path;
+	// handle values get reused after CloseHandle; reset per-handle counters
+	for (auto it = s_DiagIoctlCounts.begin(); it != s_DiagIoctlCounts.end();)
+	{
+		if (it->first.first == h) it = s_DiagIoctlCounts.erase(it);
+		else ++it;
+	}
+}
+
+static std::string DiagHex(const void* data, DWORD size, DWORD maxBytes = 64)
+{
+	if (!data || !size) return "-";
+	std::string out;
+	const BYTE* p = static_cast<const BYTE*>(data);
+	const DWORD n = (std::min<DWORD>)(size, maxBytes);
+	char buf[4];
+	for (DWORD i = 0; i < n; ++i)
+	{
+		sprintf_s(buf, sizeof(buf), "%02X", p[i]);
+		out += buf;
+		if (i + 1 < n) out += ((i + 1) % 4 == 0) ? " " : "";
+	}
+	if (size > maxBytes) out += " ...";
+	return out;
+}
+
+// For IOCTL_KS_PROPERTY & co. the input buffer starts with a KSIDENTIFIER (GUID Set, ULONG Id, ULONG Flags)
+static std::string DiagKsIdentifier(const void* in, DWORD inSize)
+{
+	if (!in || inSize < sizeof(GUID) + 2 * sizeof(ULONG)) return "";
+	const GUID* set = static_cast<const GUID*>(in);
+	const ULONG* rest = reinterpret_cast<const ULONG*>(static_cast<const BYTE*>(in) + sizeof(GUID));
+	std::ostringstream os;
+	os << " ks.set=" << DiagFmtGuid(set) << " ks.id=" << std::dec << rest[0] << " ks.flags=0x" << std::hex << rest[1];
+	return os.str();
+}
+
+static BOOL WINAPI Diag_DeviceIoControl(HANDLE h, DWORD code, LPVOID inBuf, DWORD inSize, LPVOID outBuf, DWORD outSize, LPDWORD pReturned, LPOVERLAPPED ov)
+{
+	const BOOL ret = s_Real_DeviceIoControl(h, code, inBuf, inSize, outBuf, outSize, pReturned, ov);
+	const DWORD gle = GetLastError();
+
+	std::wstring path;
+	unsigned count = 0;
+	{
+		std::lock_guard<std::mutex> g(s_DiagHandleMutex);
+		auto it = s_DiagHandlePaths.find(h);
+		if (it != s_DiagHandlePaths.end())
+			path = it->second;
+		count = ++s_DiagIoctlCounts[std::make_pair(h, code)];
+	}
+
+	// limit spam: log the first 40 calls per handle+ioctl, then every 1000th
+	if (count <= 40 || (count % 1000) == 0)
+	{
+		const DWORD returned = (ret && pReturned) ? *pReturned : 0;
+		rslog::info_ts() << "Diag_DeviceIoControl h=" << h
+			<< " path=" << (path.empty() ? std::wstring(L"(unknown)") : path)
+			<< " code=0x" << std::hex << code
+			<< " in=" << std::dec << inSize << " out=" << outSize
+			<< (ov ? " overlapped" : "")
+			<< " -> " << ret << " returned=" << returned << " gle=" << WinErrStr(gle)
+			<< " call#" << count
+			<< DiagKsIdentifier(inBuf, inSize)
+			<< " inData=" << DiagHex(inBuf, inSize)
+			<< " outData=" << ((ret && !ov) ? DiagHex(outBuf, returned) : std::string("-"))
+			<< std::endl;
+	}
+
+	SetLastError(gle);
+	return ret;
+}
+
+static HDEVINFO WINAPI Diag_SetupDiGetClassDevsW(const GUID* classGuid, PCWSTR enumerator, HWND hwnd, DWORD flags)
+{
+	HDEVINFO ret = s_Real_SetupDiGetClassDevsW(classGuid, enumerator, hwnd, flags);
+	const DWORD gle = GetLastError();
+	rslog::info_ts() << "Diag_SetupDiGetClassDevsW classGuid=" << DiagFmtGuid(classGuid)
+		<< " enumerator=" << (enumerator ? std::wstring(enumerator) : std::wstring(L"(null)"))
+		<< " flags=0x" << std::hex << flags << " -> " << ret << " gle=" << WinErrStr(gle) << std::endl;
+	SetLastError(gle);
+	return ret;
+}
+
+static BOOL WINAPI Diag_SetupDiGetDeviceRegistryPropertyW(HDEVINFO devs, PSP_DEVINFO_DATA devInfo, DWORD prop, PDWORD pRegType, PBYTE buf, DWORD bufSize, PDWORD pRequired)
+{
+	DWORD regType = 0;
+	const BOOL ret = s_Real_SetupDiGetDeviceRegistryPropertyW(devs, devInfo, prop, &regType, buf, bufSize, pRequired);
+	const DWORD gle = GetLastError();
+	if (pRegType) *pRegType = regType;
+
+	auto& log = rslog::info_ts();
+	log << "Diag_SetupDiGetDeviceRegistryPropertyW prop=" << std::dec << prop
+		<< " bufSize=" << bufSize << " -> " << ret << " gle=" << WinErrStr(gle) << " regType=" << regType;
+	if (ret && buf && (regType == REG_SZ || regType == REG_MULTI_SZ || regType == REG_EXPAND_SZ))
+	{
+		// print the first string (and following ones for MULTI_SZ)
+		const wchar_t* s = reinterpret_cast<const wchar_t*>(buf);
+		const wchar_t* end = reinterpret_cast<const wchar_t*>(buf + bufSize);
+		log << " value=";
+		while (s < end && *s)
+		{
+			log << "\"" << std::wstring(s) << "\" ";
+			s += wcslen(s) + 1;
+			if (regType != REG_MULTI_SZ) break;
+		}
+	}
+	else if (ret && buf)
+	{
+		log << " data=" << DiagHex(buf, pRequired ? *pRequired : bufSize, 32);
+	}
+	log << std::endl;
+
+	SetLastError(gle);
+	return ret;
+}
+
+static HDEVNOTIFY WINAPI Diag_RegisterDeviceNotificationW(HANDLE recipient, LPVOID filter, DWORD flags)
+{
+	HDEVNOTIFY ret = s_Real_RegisterDeviceNotificationW(recipient, filter, flags);
+	const DWORD gle = GetLastError();
+	auto& log = rslog::info_ts();
+	log << "Diag_RegisterDeviceNotificationW flags=0x" << std::hex << flags;
+	if (filter)
+	{
+		const DEV_BROADCAST_HDR* hdr = static_cast<const DEV_BROADCAST_HDR*>(filter);
+		log << " devicetype=" << std::dec << hdr->dbch_devicetype;
+		if (hdr->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE && hdr->dbch_size >= sizeof(DEV_BROADCAST_DEVICEINTERFACE_W))
+			log << " classGuid=" << DiagFmtGuid(&static_cast<const DEV_BROADCAST_DEVICEINTERFACE_W*>(filter)->dbcc_classguid);
+	}
+	log << " -> " << ret << " gle=" << WinErrStr(gle) << std::endl;
+	SetLastError(gle);
+	return ret;
+}
+
+static UINT WINAPI Diag_waveInGetNumDevs(void)
+{
+	const UINT ret = s_Real_waveInGetNumDevs();
+	rslog::info_ts() << "Diag_waveInGetNumDevs -> " << std::dec << ret << std::endl;
+	return ret;
+}
+
+static MMRESULT WINAPI Diag_waveInGetDevCapsA(UINT_PTR devId, LPWAVEINCAPSA caps, UINT capsSize)
+{
+	const MMRESULT ret = s_Real_waveInGetDevCapsA(devId, caps, capsSize);
+	auto& log = rslog::info_ts();
+	log << "Diag_waveInGetDevCapsA dev=" << std::dec << devId << " -> " << ret;
+	if (ret == MMSYSERR_NOERROR && caps)
+		log << " name=\"" << caps->szPname << "\" mid=" << caps->wMid << " pid=" << caps->wPid << " channels=" << caps->wChannels;
+	log << std::endl;
+	return ret;
+}
+
+static MMRESULT WINAPI Diag_waveInOpen(LPHWAVEIN phwi, UINT devId, LPCWAVEFORMATEX fmt, DWORD_PTR cb, DWORD_PTR inst, DWORD flags)
+{
+	const MMRESULT ret = s_Real_waveInOpen(phwi, devId, fmt, cb, inst, flags);
+	auto& log = rslog::info_ts();
+	log << "Diag_waveInOpen dev=" << std::dec << devId << " flags=0x" << std::hex << flags << " -> " << std::dec << ret;
+	if (fmt)
+		log << " fmt: tag=" << fmt->wFormatTag << " ch=" << fmt->nChannels << " rate=" << fmt->nSamplesPerSec << " bits=" << fmt->wBitsPerSample;
+	log << std::endl;
+	return ret;
+}
+
 static HANDLE WINAPI Diag_CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSA, DWORD dwCD, DWORD dwFlags, HANDLE hTemplate)
 {
 	if (IsFakeRsAsioCablePath(lpFileName))
@@ -224,6 +431,9 @@ static HANDLE WINAPI Diag_CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess,
 	}
 
 	HANDLE ret = s_Real_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSA, dwCD, dwFlags, hTemplate);
+	const DWORD createGle = GetLastError();
+	DiagTrackDeviceHandle(ret, lpFileName);
+	SetLastError(createGle);
 
 	// Log all device-like paths (\\?\ or \\.\) including the real cable path from winepipewire.
 	if (IsCableDevicePath(lpFileName) || (lpFileName && lpFileName[0] == L'\\' && lpFileName[1] == L'\\'))
@@ -571,6 +781,13 @@ void PatchOriginalCode_e0f686e0()
 		s_Real_SetupDiOpenDeviceInterfaceRegKey = (PFN_SetupDiOpenDeviceInterfaceRegKey)ReadSlot(IAT_RVA_SetupDiOpenDeviceInterfaceRegKey);
 		s_Real_SetupDiDestroyDeviceInfoList  = (PFN_SetupDiDestroyDeviceInfoList) ReadSlot(IAT_RVA_SetupDiDestroyDeviceInfoList);
 		s_Real_CreateFileW                   = (PFN_CreateFileW)                  ReadSlot(IAT_RVA_CreateFileW);
+		s_Real_DeviceIoControl               = (PFN_DeviceIoControl)              ReadSlot(IAT_RVA_DeviceIoControl);
+		s_Real_SetupDiGetClassDevsW          = (PFN_SetupDiGetClassDevsW)         ReadSlot(IAT_RVA_SetupDiGetClassDevsW);
+		s_Real_SetupDiGetDeviceRegistryPropertyW = (PFN_SetupDiGetDeviceRegistryPropertyW)ReadSlot(IAT_RVA_SetupDiGetDeviceRegistryPropertyW);
+		s_Real_RegisterDeviceNotificationW   = (PFN_RegisterDeviceNotificationW)  ReadSlot(IAT_RVA_RegisterDeviceNotificationW);
+		s_Real_waveInOpen                    = (PFN_waveInOpen)                   ReadSlot(IAT_RVA_waveInOpen);
+		s_Real_waveInGetNumDevs              = (PFN_waveInGetNumDevs)             ReadSlot(IAT_RVA_waveInGetNumDevs);
+		s_Real_waveInGetDevCapsA             = (PFN_waveInGetDevCapsA)            ReadSlot(IAT_RVA_waveInGetDevCapsA);
 	}
 
 	bool ok = true;
@@ -595,6 +812,13 @@ void PatchOriginalCode_e0f686e0()
 	PatchIATEntry(IAT_RVA_SetupDiOpenDeviceInterfaceRegKey,reinterpret_cast<void*>(&Diag_SetupDiOpenDeviceInterfaceRegKey),"SetupDiOpenDeviceInterfaceRegKey");
 	PatchIATEntry(IAT_RVA_SetupDiDestroyDeviceInfoList,   reinterpret_cast<void*>(&Diag_SetupDiDestroyDeviceInfoList),   "SetupDiDestroyDeviceInfoList");
 	PatchIATEntry(IAT_RVA_CreateFileW,                    reinterpret_cast<void*>(&Diag_CreateFileW),                    "CreateFileW");
+	PatchIATEntry(IAT_RVA_DeviceIoControl,                reinterpret_cast<void*>(&Diag_DeviceIoControl),                "DeviceIoControl");
+	PatchIATEntry(IAT_RVA_SetupDiGetClassDevsW,           reinterpret_cast<void*>(&Diag_SetupDiGetClassDevsW),           "SetupDiGetClassDevsW");
+	PatchIATEntry(IAT_RVA_SetupDiGetDeviceRegistryPropertyW, reinterpret_cast<void*>(&Diag_SetupDiGetDeviceRegistryPropertyW), "SetupDiGetDeviceRegistryPropertyW");
+	PatchIATEntry(IAT_RVA_RegisterDeviceNotificationW,    reinterpret_cast<void*>(&Diag_RegisterDeviceNotificationW),    "RegisterDeviceNotificationW");
+	PatchIATEntry(IAT_RVA_waveInOpen,                     reinterpret_cast<void*>(&Diag_waveInOpen),                     "waveInOpen");
+	PatchIATEntry(IAT_RVA_waveInGetNumDevs,               reinterpret_cast<void*>(&Diag_waveInGetNumDevs),               "waveInGetNumDevs");
+	PatchIATEntry(IAT_RVA_waveInGetDevCapsA,              reinterpret_cast<void*>(&Diag_waveInGetDevCapsA),              "waveInGetDevCapsA");
 
 	if (!ok)
 	{

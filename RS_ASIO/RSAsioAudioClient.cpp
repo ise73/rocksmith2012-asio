@@ -173,9 +173,12 @@ HRESULT RSAsioAudioClient::Initialize(AUDCLNT_SHAREMODE ShareMode, DWORD StreamF
 		DWORD pollFrames = m_AsioDevice.GetConfig().pollingBufferSize;
 		if (pollFrames == 0)
 		{
-			// output: what the game asked for plus two ASIO buffers of headroom for its wake-up jitter
+			// output: what the game asked for plus some headroom for its wake-up jitter
+			//         (two ASIO buffers, at most 256 frames), but never less than two ASIO buffers
 			// input: what the game asked for, but at least two ASIO buffers
-			pollFrames = isOutput ? (hostFrames + 2 * numFrames) : (std::max<DWORD>)(hostFrames, 2 * numFrames);
+			pollFrames = isOutput
+				? (std::max<DWORD>)(hostFrames + (std::min<DWORD>)(2 * numFrames, 256), 2 * numFrames)
+				: (std::max<DWORD>)(hostFrames, 2 * numFrames);
 		}
 		if (pollFrames < numFrames)
 			pollFrames = numFrames;
