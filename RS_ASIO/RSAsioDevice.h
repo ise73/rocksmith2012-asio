@@ -26,6 +26,7 @@ public:
 		bool enableSoftwareEndpointVolmeControl = true;
 		bool enableSoftwareMasterVolumeControl = true;
 		bool isMicrophone = false;
+		bool emulateRealToneCable = false;
 		std::optional<bool> enableRefCountHack;
 	};
 

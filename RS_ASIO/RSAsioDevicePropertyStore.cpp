@@ -27,7 +27,7 @@ HRESULT STDMETHODCALLTYPE RSAsioDevicePropertyStore::GetCount(DWORD *cProps)
 		*cProps = 2;
 	else
 	{
-		if (m_AsioDevice.GetConfig().isMicrophone)
+		if (m_AsioDevice.GetConfig().isMicrophone && !m_AsioDevice.GetConfig().emulateRealToneCable)
 			*cProps = 3;
 		else
 			*cProps = 5;
@@ -107,8 +107,30 @@ HRESULT STDMETHODCALLTYPE RSAsioDevicePropertyStore::GetValue(REFPROPERTYKEY key
 		}
 		else if (key == PKEY_Device_FriendlyName)
 		{
-			if (SUCCEEDED(m_AsioDevice.GetId(&pv->pwszVal)))
+			if (m_AsioDevice.GetConfig().emulateRealToneCable)
 			{
+				// what a real cable endpoint is called (the "Microphone" part is localized by Windows)
+				const wchar_t strName[] = L"Microphone (Rocksmith USB Guitar Adapter)";
+				if (pv->pwszVal = (LPWSTR)CoTaskMemAlloc(sizeof(strName)))
+				{
+					memcpy(pv->pwszVal, strName, sizeof(strName));
+					pv->vt = VT_LPWSTR;
+				}
+			}
+			else if (SUCCEEDED(m_AsioDevice.GetId(&pv->pwszVal)))
+			{
+				pv->vt = VT_LPWSTR;
+			}
+		}
+		else if (key == PKEY_Device_DeviceIdHiddenKey1 && m_AsioDevice.GetConfig().emulateRealToneCable)
+		{
+			// Rocksmith 2011 looks for a property containing the cable's USB VID/PID.
+			// Mirror the format a real cable endpoint exposes on Windows.
+			const wchar_t strDeviceId[] = L"{1}.USB\\VID_12BA&PID_00FF&MI_00\\RS_ASIO&0&0000";
+
+			if (pv->pwszVal = (LPWSTR)CoTaskMemAlloc(sizeof(strDeviceId)))
+			{
+				memcpy(pv->pwszVal, strDeviceId, sizeof(strDeviceId));
 				pv->vt = VT_LPWSTR;
 			}
 		}
@@ -135,7 +157,9 @@ HRESULT STDMETHODCALLTYPE RSAsioDevicePropertyStore::GetValue(REFPROPERTYKEY key
 		else if (key == PKEY_AudioEndpoint_FormFactor)
 		{
 			pv->vt = VT_UI4;
-			pv->ulVal = m_AsioDevice.GetConfig().isMicrophone ? Microphone : LineLevel;
+			// Rocksmith 2011 only inspects capture endpoints whose form factor is Microphone
+			// (that's what a real cable reports), so an emulated cable must report it too.
+			pv->ulVal = (m_AsioDevice.GetConfig().isMicrophone || m_AsioDevice.GetConfig().emulateRealToneCable) ? Microphone : LineLevel;
 		}
 	}
 

@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "dllmain.h"
 #include "Patcher.h"
+#include "RSAsioDeviceEnum.h"
 #include <setupapi.h>
 #include <mmsystem.h>
 #include <dbt.h>
@@ -69,6 +70,61 @@ static std::string WinErrStr(DWORD gle)
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Real Tone Cable emulation (EmulateRealToneCable=1 on an ASIO input).
+//
+// The game scans KSCATEGORY_AUDIO with SetupAPI looking for the cable's USB
+// VID/PID. When emulation is on and no real cable is present, we append one
+// synthetic interface to that scan. It never reaches the real SetupAPI: the
+// SP_DEVICE_INTERFACE_DATA is tagged through its Reserved field and every hook
+// below answers for it itself. CreateFileW on its path is sent to NUL (see
+// IsFakeRsAsioCablePath), like the synthetic entry of the Wine workaround.
+// ---------------------------------------------------------------------------
+
+static const GUID kKsCategoryAudio = { 0x6994AD04, 0x93EF, 0x11D0, { 0xA3, 0xCC, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96 } };
+static const GUID kDevClassMedia   = { 0x4D36E96C, 0xE325, 0x11CE, { 0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18 } };
+static const ULONG_PTR kFakeCableReserved = 0x52534331; // "RSC1"
+static const wchar_t kFakeCablePath[] = L"\\\\?\\usb#vid_12ba&pid_00ff&mi_00#rs_asio_emulated#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\\global";
+static const wchar_t kFakeCableRegKey[] = L"Software\\RS_ASIO\\EmulatedRealToneCable\\Device Parameters";
+
+static std::mutex s_FakeCableMutex;
+static std::map<HDEVINFO, DWORD> s_FakeCableIndex; // member index of our fake entry per set, MAXDWORD = don't inject
+
+static bool IsFakeCableIface(PSP_DEVICE_INTERFACE_DATA d)
+{
+	return d && d->Reserved == kFakeCableReserved;
+}
+
+static void FillFakeCableIface(PSP_DEVICE_INTERFACE_DATA d, const GUID& classGuid)
+{
+	d->InterfaceClassGuid = classGuid;
+	d->Flags = SPINT_ACTIVE;
+	d->Reserved = kFakeCableReserved;
+}
+
+// Walks the set with the real SetupAPI (not our hooks) looking for an actual cable.
+static bool SetContainsRealCable(HDEVINFO set, const GUID* ifaceGuid)
+{
+	std::vector<BYTE> buf(2048);
+	for (DWORD i = 0; ; ++i)
+	{
+		SP_DEVICE_INTERFACE_DATA ifd{};
+		ifd.cbSize = sizeof(ifd);
+		if (!s_Real_SetupDiEnumDeviceInterfaces(set, nullptr, ifaceGuid, i, &ifd))
+			return false;
+
+		auto* detail = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(buf.data());
+		detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+		if (s_Real_SetupDiGetDeviceInterfaceDetailW(set, &ifd, detail, (DWORD)buf.size(), nullptr, nullptr))
+		{
+			std::wstring p(detail->DevicePath);
+			std::transform(p.begin(), p.end(), p.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
+			if (p.find(L"vid_12ba&pid_00ff") != std::wstring::npos)
+				return true;
+		}
+	}
+}
+
 static HDEVINFO WINAPI Diag_SetupDiGetClassDevsA(const GUID* ClassGuid, PCSTR Enumerator, HWND hwndParent, DWORD Flags)
 {
 	HDEVINFO ret = s_Real_SetupDiGetClassDevsA(ClassGuid, Enumerator, hwndParent, Flags);
@@ -87,8 +143,55 @@ static HDEVINFO WINAPI Diag_SetupDiGetClassDevsA(const GUID* ClassGuid, PCSTR En
 
 static BOOL WINAPI Diag_SetupDiEnumDeviceInterfaces(HDEVINFO Set, PSP_DEVINFO_DATA DevData, const GUID* IfaceGuid, DWORD MemberIdx, PSP_DEVICE_INTERFACE_DATA IfaceData)
 {
+	const bool emulationApplies = g_EmulateRealToneCable && !DevData && IfaceGuid && IfaceData && IsEqualGUID(*IfaceGuid, kKsCategoryAudio);
+	if (emulationApplies)
+	{
+		std::lock_guard<std::mutex> g(s_FakeCableMutex);
+		auto it = s_FakeCableIndex.find(Set);
+		if (it != s_FakeCableIndex.end() && it->second != MAXDWORD)
+		{
+			if (MemberIdx == it->second)
+			{
+				FillFakeCableIface(IfaceData, *IfaceGuid);
+				rslog::info_ts() << "Patched_SetupDiEnumDeviceInterfaces - MemberIndex=" << std::dec << MemberIdx << " -> emulated Real Tone Cable interface" << std::endl;
+				SetLastError(ERROR_SUCCESS);
+				return TRUE;
+			}
+			if (MemberIdx > it->second)
+			{
+				SetLastError(ERROR_NO_MORE_ITEMS);
+				return FALSE;
+			}
+		}
+	}
+
 	BOOL ret = s_Real_SetupDiEnumDeviceInterfaces(Set, DevData, IfaceGuid, MemberIdx, IfaceData);
 	DWORD gle = GetLastError();
+
+	if (emulationApplies && !ret && gle == ERROR_NO_MORE_ITEMS)
+	{
+		bool known = false;
+		{
+			std::lock_guard<std::mutex> g(s_FakeCableMutex);
+			known = s_FakeCableIndex.find(Set) != s_FakeCableIndex.end();
+		}
+		if (!known)
+		{
+			const bool hasRealCable = SetContainsRealCable(Set, IfaceGuid);
+			std::lock_guard<std::mutex> g(s_FakeCableMutex);
+			s_FakeCableIndex[Set] = hasRealCable ? MAXDWORD : MemberIdx;
+			rslog::info_ts() << "Patched_SetupDiEnumDeviceInterfaces - "
+				<< (hasRealCable ? "a real Real Tone Cable is connected, not adding the emulated one"
+				                 : "no Real Tone Cable found, adding the emulated one") << std::endl;
+			if (!hasRealCable)
+			{
+				FillFakeCableIface(IfaceData, *IfaceGuid);
+				rslog::info_ts() << "Patched_SetupDiEnumDeviceInterfaces - MemberIndex=" << std::dec << MemberIdx << " -> emulated Real Tone Cable interface" << std::endl;
+				SetLastError(ERROR_SUCCESS);
+				return TRUE;
+			}
+		}
+	}
 	rslog::info_ts() << "Patched_SetupDiEnumDeviceInterfaces - MemberIndex=" << MemberIdx
 	                 << " ifaceClassGuid=" << DiagFmtGuid(IfaceGuid)
 	                 << " -> " << ret << " gle=" << WinErrStr(gle);
@@ -107,6 +210,29 @@ static BOOL WINAPI Diag_SetupDiEnumDeviceInterfaces(HDEVINFO Set, PSP_DEVINFO_DA
 
 static BOOL WINAPI Diag_SetupDiGetDeviceInterfaceDetailW(HDEVINFO Set, PSP_DEVICE_INTERFACE_DATA IfaceData, PSP_DEVICE_INTERFACE_DETAIL_DATA_W Detail, DWORD DetailSize, PDWORD RequiredSize, PSP_DEVINFO_DATA DevData)
 {
+	if (IsFakeCableIface(IfaceData))
+	{
+		const DWORD required = (DWORD)(offsetof(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath) + sizeof(kFakeCablePath));
+		if (RequiredSize)
+			*RequiredSize = required;
+		if (DevData && DevData->cbSize >= sizeof(SP_DEVINFO_DATA))
+		{
+			DevData->ClassGuid = kDevClassMedia;
+			DevData->DevInst = 0;
+			DevData->Reserved = 0;
+		}
+		if (!Detail || DetailSize < required)
+		{
+			rslog::info_ts() << "Patched_SetupDiGetDeviceInterfaceDetailW (emulated cable) - size query, required=" << std::dec << required << std::endl;
+			SetLastError(ERROR_INSUFFICIENT_BUFFER);
+			return FALSE;
+		}
+		memcpy(Detail->DevicePath, kFakeCablePath, sizeof(kFakeCablePath));
+		rslog::info_ts() << "Patched_SetupDiGetDeviceInterfaceDetailW (emulated cable) - path: " << std::wstring(kFakeCablePath) << std::endl;
+		SetLastError(ERROR_SUCCESS);
+		return TRUE;
+	}
+
 	BOOL ret = s_Real_SetupDiGetDeviceInterfaceDetailW(Set, IfaceData, Detail, DetailSize, RequiredSize, DevData);
 	DWORD gle = GetLastError();
 	rslog::info_ts() << "Patched_SetupDiGetDeviceInterfaceDetailW - detailSize=" << DetailSize
@@ -161,6 +287,33 @@ static BOOL WINAPI Diag_SetupDiGetDeviceInterfaceAlias(HDEVINFO Set, PSP_DEVICE_
 
 static HKEY WINAPI Diag_SetupDiOpenDeviceInterfaceRegKey(HDEVINFO Set, PSP_DEVICE_INTERFACE_DATA IfaceData, DWORD Reserved, REGSAM samDesired)
 {
+	if (IsFakeCableIface(IfaceData))
+	{
+		// Hand out a per-user key with the values a real cable's "Device Parameters" key has.
+		HKEY hKey = nullptr;
+		LSTATUS st = RegCreateKeyExW(HKEY_CURRENT_USER, kFakeCableRegKey, 0, nullptr, REG_OPTION_VOLATILE,
+		                             KEY_READ | KEY_WRITE, nullptr, &hKey, nullptr);
+		if (st == ERROR_SUCCESS)
+		{
+			static const wchar_t kFriendlyName[] = L"Rocksmith USB Guitar Adapter";
+			static const wchar_t kClsid[] = L"{17CCA71B-ECD7-11D0-B908-00A0C9223196}"; // KS proxy
+			RegSetValueExW(hKey, L"FriendlyName", 0, REG_SZ, reinterpret_cast<const BYTE*>(kFriendlyName), sizeof(kFriendlyName));
+			RegSetValueExW(hKey, L"CLSID", 0, REG_SZ, reinterpret_cast<const BYTE*>(kClsid), sizeof(kClsid));
+			RegCloseKey(hKey);
+			hKey = nullptr;
+			st = RegOpenKeyExW(HKEY_CURRENT_USER, kFakeCableRegKey, 0, samDesired ? samDesired : KEY_READ, &hKey);
+		}
+		rslog::info_ts() << "Patched_SetupDiOpenDeviceInterfaceRegKey (emulated cable) -> " << (st == ERROR_SUCCESS ? hKey : INVALID_HANDLE_VALUE)
+		                 << " status=" << std::dec << st << std::endl;
+		if (st != ERROR_SUCCESS)
+		{
+			SetLastError(st);
+			return (HKEY)INVALID_HANDLE_VALUE;
+		}
+		SetLastError(ERROR_SUCCESS);
+		return hKey;
+	}
+
 	HKEY ret = s_Real_SetupDiOpenDeviceInterfaceRegKey(Set, IfaceData, Reserved, samDesired);
 	DWORD gle = GetLastError();
 	rslog::info_ts() << "Patched_SetupDiOpenDeviceInterfaceRegKey - samDesired=0x" << std::hex << samDesired
@@ -176,6 +329,10 @@ static HKEY WINAPI Diag_SetupDiOpenDeviceInterfaceRegKey(HDEVINFO Set, PSP_DEVIC
 
 static BOOL WINAPI Diag_SetupDiDestroyDeviceInfoList(HDEVINFO Set)
 {
+	{
+		std::lock_guard<std::mutex> g(s_FakeCableMutex);
+		s_FakeCableIndex.erase(Set);
+	}
 	BOOL ret = s_Real_SetupDiDestroyDeviceInfoList(Set);
 	rslog::info_ts() << "Patched_SetupDiDestroyDeviceInfoList -> " << ret << " gle=" << WinErrStr(GetLastError())
 	                 << " [KS cable scan complete - see CreateFileW results above for outcome]" << std::endl;
@@ -220,6 +377,7 @@ static const DWORD IAT_RVA_RegisterDeviceNotificationW        = 0x0088d3b0;
 static const DWORD IAT_RVA_waveInOpen                         = 0x0088d3e4;
 static const DWORD IAT_RVA_waveInGetNumDevs                   = 0x0088d3fc;
 static const DWORD IAT_RVA_waveInGetDevCapsA                  = 0x0088d400;
+static const DWORD IAT_RVA_RegQueryValueExW                   = 0x0088d000;
 
 typedef BOOL (WINAPI* PFN_DeviceIoControl)(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 typedef HDEVINFO (WINAPI* PFN_SetupDiGetClassDevsW)(const GUID*, PCWSTR, HWND, DWORD);
@@ -228,6 +386,7 @@ typedef HDEVNOTIFY (WINAPI* PFN_RegisterDeviceNotificationW)(HANDLE, LPVOID, DWO
 typedef MMRESULT (WINAPI* PFN_waveInOpen)(LPHWAVEIN, UINT, LPCWAVEFORMATEX, DWORD_PTR, DWORD_PTR, DWORD);
 typedef UINT (WINAPI* PFN_waveInGetNumDevs)(void);
 typedef MMRESULT (WINAPI* PFN_waveInGetDevCapsA)(UINT_PTR, LPWAVEINCAPSA, UINT);
+typedef LSTATUS (WINAPI* PFN_RegQueryValueExW)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
 
 static PFN_DeviceIoControl                   s_Real_DeviceIoControl = nullptr;
 static PFN_SetupDiGetClassDevsW              s_Real_SetupDiGetClassDevsW = nullptr;
@@ -236,6 +395,28 @@ static PFN_RegisterDeviceNotificationW       s_Real_RegisterDeviceNotificationW 
 static PFN_waveInOpen                        s_Real_waveInOpen = nullptr;
 static PFN_waveInGetNumDevs                  s_Real_waveInGetNumDevs = nullptr;
 static PFN_waveInGetDevCapsA                 s_Real_waveInGetDevCapsA = nullptr;
+static PFN_RegQueryValueExW                  s_Real_RegQueryValueExW = nullptr;
+
+static LSTATUS WINAPI Diag_RegQueryValueExW(HKEY hKey, LPCWSTR name, LPDWORD reserved, LPDWORD pType, LPBYTE data, LPDWORD pcbData)
+{
+	DWORD type = 0;
+	const LSTATUS st = s_Real_RegQueryValueExW(hKey, name, reserved, &type, data, pcbData);
+	if (pType) *pType = type;
+
+	static LONG s_count = 0;
+	if (InterlockedIncrement(&s_count) <= 300)
+	{
+		auto& log = rslog::info_ts();
+		log << "Diag_RegQueryValueExW key=" << hKey << " name=" << (name ? std::wstring(name) : std::wstring(L"(default)"))
+			<< " -> " << std::dec << st << " type=" << type;
+		if (st == ERROR_SUCCESS && data && pcbData && (type == REG_SZ || type == REG_EXPAND_SZ) && *pcbData >= sizeof(wchar_t))
+			log << " value=\"" << std::wstring(reinterpret_cast<const wchar_t*>(data), *pcbData / sizeof(wchar_t) - 1) << "\"";
+		else if (st == ERROR_SUCCESS && data && pcbData && type == REG_DWORD && *pcbData == sizeof(DWORD))
+			log << " value=" << *reinterpret_cast<const DWORD*>(data);
+		log << std::endl;
+	}
+	return st;
+}
 
 static std::mutex s_DiagHandleMutex;
 static std::map<HANDLE, std::wstring> s_DiagHandlePaths;
@@ -255,7 +436,7 @@ static void DiagTrackDeviceHandle(HANDLE h, LPCWSTR path)
 	}
 }
 
-static std::string DiagHex(const void* data, DWORD size, DWORD maxBytes = 64)
+static std::string DiagHex(const void* data, DWORD size, DWORD maxBytes = 512)
 {
 	if (!data || !size) return "-";
 	std::string out;
@@ -788,6 +969,7 @@ void PatchOriginalCode_e0f686e0()
 		s_Real_waveInOpen                    = (PFN_waveInOpen)                   ReadSlot(IAT_RVA_waveInOpen);
 		s_Real_waveInGetNumDevs              = (PFN_waveInGetNumDevs)             ReadSlot(IAT_RVA_waveInGetNumDevs);
 		s_Real_waveInGetDevCapsA             = (PFN_waveInGetDevCapsA)            ReadSlot(IAT_RVA_waveInGetDevCapsA);
+		s_Real_RegQueryValueExW              = (PFN_RegQueryValueExW)             ReadSlot(IAT_RVA_RegQueryValueExW);
 	}
 
 	bool ok = true;
@@ -819,6 +1001,7 @@ void PatchOriginalCode_e0f686e0()
 	PatchIATEntry(IAT_RVA_waveInOpen,                     reinterpret_cast<void*>(&Diag_waveInOpen),                     "waveInOpen");
 	PatchIATEntry(IAT_RVA_waveInGetNumDevs,               reinterpret_cast<void*>(&Diag_waveInGetNumDevs),               "waveInGetNumDevs");
 	PatchIATEntry(IAT_RVA_waveInGetDevCapsA,              reinterpret_cast<void*>(&Diag_waveInGetDevCapsA),              "waveInGetDevCapsA");
+	PatchIATEntry(IAT_RVA_RegQueryValueExW,               reinterpret_cast<void*>(&Diag_RegQueryValueExW),               "RegQueryValueExW");
 
 	if (!ok)
 	{

@@ -27,7 +27,12 @@ struct RSAsioInputConfig
 	bool microphone = false;
 	std::optional<bool> enableRefCountHack;
 	std::string wasapiRedirectId; // if non-empty, redirect this WASAPI device ID (or sub-ID) to use this ASIO input
+	bool emulateRealToneCable = false; // present this input to the game as a Real Tone Cable (no cable needed)
 };
+
+// Set when any ASIO input has EmulateRealToneCable=1. Read by the Rocksmith 2011 patcher,
+// which then adds a fake Real Tone Cable entry to the game's SetupAPI/KS device scan.
+extern bool g_EmulateRealToneCable;
 
 // Registry of WASAPI device ID → IMMDevice (ASIO-backed) for audio client redirect.
 // Populated by RSAsioDeviceEnum when WasapiDevice= is configured in RS_ASIO.ini.

@@ -4,6 +4,8 @@
 #include "AsioHelpers.h"
 #include "AsioSharedHost.h"
 
+bool g_EmulateRealToneCable = false;
+
 // ---------------------------------------------------------------------------
 // WASAPI device ID → ASIO-backed IMMDevice redirect registry
 // Populated at startup when [Asio.InputN] WasapiDevice= is configured.
@@ -161,6 +163,12 @@ void RSAsioDeviceEnum::UpdateAvailableDevices()
 				config.enableSoftwareEndpointVolmeControl = inputCfg.enableSoftwareEndpointVolumeControl;
 				config.enableSoftwareMasterVolumeControl = inputCfg.enableSoftwareMasterVolumeControl;
 				config.isMicrophone = inputCfg.microphone;
+				config.emulateRealToneCable = inputCfg.emulateRealToneCable;
+				if (inputCfg.emulateRealToneCable)
+				{
+					g_EmulateRealToneCable = true;
+					rslog::info_ts() << __FUNCTION__ << " - input[" << inputIdx << "] will be presented to the game as a Real Tone Cable" << std::endl;
+				}
 				config.enableRefCountHack = inputCfg.enableRefCountHack;
 
 				auto device = new RSAsioDevice(*host, id, config);
