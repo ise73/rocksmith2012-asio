@@ -258,6 +258,13 @@ static HANDLE WINAPI Diag_CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess,
 // instance ID so we can identify our own entries unambiguously.
 // ---------------------------------------------------------------------------
 
+static bool IsRunningUnderWine()
+{
+	// Wine's ntdll exports wine_get_version; native Windows' ntdll does not.
+	const HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+	return hNtdll && GetProcAddress(hNtdll, "wine_get_version") != nullptr;
+}
+
 static void EnsureRealToneCableRegistered()
 {
 	rslog::info_ts() << "EnsureRealToneCableRegistered - checking KS device class registrations..." << std::endl;
@@ -539,7 +546,16 @@ void PatchOriginalCode_e0f686e0()
 	// Wine/Proton regression: newer versions no longer auto-register USB audio devices
 	// in the KS device class registry. Create the missing entries so that the game's
 	// SetupAPI cable-presence check finds the Real Tone Cable.
-	EnsureRealToneCableRegistered();
+	// On native Windows the OS registers the cable itself, and writing to HKLM needs
+	// admin rights anyway (it fails with ERROR_ACCESS_DENIED), so only do this under Wine.
+	if (IsRunningUnderWine())
+	{
+		EnsureRealToneCableRegistered();
+	}
+	else
+	{
+		rslog::info_ts() << __FUNCTION__ << " - native Windows detected, skipping KS registry fix-up (Wine only)" << std::endl;
+	}
 
 	// Capture original function pointers from the IAT before we overwrite the slots.
 	// The diagnostic wrappers call through these to preserve real behaviour.
