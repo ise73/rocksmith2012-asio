@@ -161,7 +161,42 @@ HRESULT RSAsioAudioClient::Initialize(AUDCLNT_SHAREMODE ShareMode, DWORD StreamF
 	m_backBuffer.resize(pFormat->nBlockAlign * numFrames);
 	memset(m_frontBuffer.data(), 0, m_frontBuffer.size());
 	memset(m_backBuffer.data(), 0, m_backBuffer.size());
-	
+
+	// Polling mode (Rocksmith 2011): put a FIFO between the game and ASIO so the game can
+	// write/read in its own (larger) chunks while ASIO runs with a small buffer.
+	m_PollingFifoMode = !useEventCallback && m_AsioDevice.GetConfig().enablePollingRingBuffer;
+	if (m_PollingFifoMode)
+	{
+		const bool isOutput = m_AsioDevice.GetConfig().isOutput;
+		const DWORD hostFrames = (DWORD)DurationToAudioFrames(hnsBufferDuration, pFormat->nSamplesPerSec);
+
+		DWORD pollFrames = m_AsioDevice.GetConfig().pollingBufferSize;
+		if (pollFrames == 0)
+		{
+			// output: what the game asked for plus two ASIO buffers of headroom for its wake-up jitter
+			// input: what the game asked for, but at least two ASIO buffers
+			pollFrames = isOutput ? (hostFrames + 2 * numFrames) : (std::max<DWORD>)(hostFrames, 2 * numFrames);
+		}
+		if (pollFrames < numFrames)
+			pollFrames = numFrames;
+		// round up to a whole number of ASIO buffers
+		pollFrames = ((pollFrames + numFrames - 1) / numFrames) * numFrames;
+
+		m_PollingBufferFrames = pollFrames;
+		m_PollingFifo.Init(pFormat->nBlockAlign, isOutput ? pollFrames : pollFrames * 4);
+		m_PollingPacket.assign((size_t)pFormat->nBlockAlign * pollFrames, 0);
+		m_PollingCaptureOverflow = false;
+		m_PollingXrunCount = 0;
+		m_PollingXrunLogged = 0;
+
+		rslog::info_ts() << std::dec << m_AsioDevice.GetIdRef() << " " << __FUNCTION__ << " - polling mode: using FIFO of " << pollFrames << " frames ("
+			<< RefTimeToMilisecs(AudioFramesToDuration(pollFrames, pFormat->nSamplesPerSec)) << "ms) on top of " << numFrames << " frame ASIO buffer" << std::endl;
+	}
+	else
+	{
+		m_PollingBufferFrames = 0;
+	}
+
 	m_UsingEventHandle = useEventCallback;
 	m_IsInitialized = true;
 	m_BuffersWereSwapped = false;
@@ -182,7 +217,7 @@ HRESULT RSAsioAudioClient::GetBufferSize(UINT32 *pNumBufferFrames)
 	if (!m_AsioSharedHost.IsValid())
 		return AUDCLNT_E_DEVICE_INVALIDATED;
 
-	*pNumBufferFrames = m_AsioSharedHost.GetBufferNumFrames();
+	*pNumBufferFrames = m_PollingFifoMode ? m_PollingBufferFrames : m_AsioSharedHost.GetBufferNumFrames();
 
 	return S_OK;
 }
@@ -214,6 +249,12 @@ HRESULT RSAsioAudioClient::GetCurrentPadding(UINT32 *pNumPaddingFrames)
 
 	if (!m_IsInitialized)
 		return AUDCLNT_E_NOT_INITIALIZED;
+
+	if (m_PollingFifoMode)
+	{
+		*pNumPaddingFrames = PollingGetPadding();
+		return S_OK;
+	}
 
 	bool isBufferWaiting = false;
 
@@ -389,6 +430,12 @@ HRESULT RSAsioAudioClient::Reset()
 	if (m_IsStarted)
 		return AUDCLNT_E_NOT_STOPPED;
 
+	if (m_PollingFifoMode)
+	{
+		std::lock_guard<std::mutex> g2(m_bufferMutex);
+		m_PollingFifo.Clear();
+	}
+
 	return S_OK;
 }
 
@@ -548,6 +595,11 @@ void RSAsioAudioClient::OnAsioBufferSwitch(unsigned buffIdx)
 	float fSoftwareVolumeScalar = 1.0f;
 	bool doSoftwareVolume = m_AsioDevice.GetSoftwareVolumeScalar(&fSoftwareVolumeScalar);
 	
+	if (isOutput && m_PollingFifoMode && m_IsStarted)
+	{
+		PollingOnAsioBufferSwitch_Output();
+	}
+
 	if (isOutput)
 	{
 		// no need to do software volume if we're streaming silence
@@ -617,15 +669,21 @@ void RSAsioAudioClient::OnAsioBufferSwitch(unsigned buffIdx)
 			const DWORD totalSamples = m_bufferNumFrames * m_WaveFormat.Format.nChannels;
 			AudioProcessing::DoSoftwareVolumeDsp(m_frontBuffer.data(), gameSampleType, totalSamples, fSoftwareVolumeScalar);
 		}
+
+		if (m_PollingFifoMode && m_IsStarted)
+		{
+			PollingOnAsioBufferSwitch_Input();
+		}
 	}
 
 	if (m_IsStarted)
 	{
-		if (m_CaptureClient)
+		// in polling FIFO mode the FIFO does the book-keeping (and xrun logging) instead
+		if (m_CaptureClient && !m_PollingFifoMode)
 		{
 			m_CaptureClient->NotifyNewBuffer();
 		}
-		if (m_RenderClient)
+		if (m_RenderClient && !m_PollingFifoMode)
 		{
 			m_RenderClient->NotifyNewBuffer();
 		}
@@ -701,4 +759,88 @@ void RSAsioAudioClient::UpdateChannelMap()
 				m_ChannelMap[i] = wantedAsioBuffer;
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Polling mode FIFO (Rocksmith 2011)
+// ---------------------------------------------------------------------------
+
+UINT32 RSAsioAudioClient::PollingGetPadding()
+{
+	std::lock_guard<std::mutex> g(m_bufferMutex);
+	const DWORD fill = m_PollingFifo.GetFillFrames();
+	return (std::min<DWORD>)(fill, m_PollingBufferFrames);
+}
+
+BYTE* RSAsioAudioClient::PollingGetRenderBuffer(UINT32 numFrames)
+{
+	std::lock_guard<std::mutex> g(m_bufferMutex);
+	if (numFrames > m_PollingFifo.GetFreeFrames() || numFrames > m_PollingBufferFrames)
+		return nullptr;
+	return m_PollingPacket.data();
+}
+
+void RSAsioAudioClient::PollingCommitRender(UINT32 numFrames, bool silent)
+{
+	std::lock_guard<std::mutex> g(m_bufferMutex);
+	m_PollingFifo.Write(silent ? nullptr : m_PollingPacket.data(), numFrames);
+}
+
+UINT32 RSAsioAudioClient::PollingGetNextCapturePacketSize()
+{
+	std::lock_guard<std::mutex> g(m_bufferMutex);
+	return (std::min<DWORD>)(m_PollingFifo.GetFillFrames(), m_PollingBufferFrames);
+}
+
+UINT32 RSAsioAudioClient::PollingReadCapture(BYTE** ppData, bool* outDiscontinuity)
+{
+	std::lock_guard<std::mutex> g(m_bufferMutex);
+
+	const DWORD numFrames = m_PollingFifo.Read(m_PollingPacket.data(), m_PollingBufferFrames);
+	*ppData = numFrames ? m_PollingPacket.data() : nullptr;
+	if (outDiscontinuity)
+		*outDiscontinuity = m_PollingCaptureOverflow;
+	m_PollingCaptureOverflow = false;
+
+	return numFrames;
+}
+
+// called from the ASIO thread with m_bufferMutex held
+void RSAsioAudioClient::PollingOnAsioBufferSwitch_Output()
+{
+	const DWORD got = m_PollingFifo.Read(m_frontBuffer.data(), m_bufferNumFrames);
+	if (got < m_bufferNumFrames)
+	{
+		// underrun: the game didn't write enough in time, pad with silence
+		const DWORD blockAlign = m_WaveFormat.Format.nBlockAlign;
+		memset(m_frontBuffer.data() + (size_t)got * blockAlign, 0, (size_t)(m_bufferNumFrames - got) * blockAlign);
+
+		++m_PollingXrunCount;
+		if (m_PollingXrunLogged < 20 || (m_PollingXrunCount % 1000) == 0)
+		{
+			++m_PollingXrunLogged;
+			rslog::info_ts() << m_AsioDevice.GetIdRef() << " polling FIFO underrun (" << std::dec << got << "/" << m_bufferNumFrames
+				<< " frames available, total underruns: " << m_PollingXrunCount << ")" << std::endl;
+		}
+	}
+	m_BuffersWereSwapped = got > 0;
+}
+
+// called from the ASIO thread with m_bufferMutex held
+void RSAsioAudioClient::PollingOnAsioBufferSwitch_Input()
+{
+	if (m_PollingFifo.GetFreeFrames() < m_bufferNumFrames)
+	{
+		// the game isn't reading fast enough: drop the oldest data to keep latency bounded
+		m_PollingFifo.Read(nullptr, m_bufferNumFrames - m_PollingFifo.GetFreeFrames());
+		m_PollingCaptureOverflow = true;
+
+		++m_PollingXrunCount;
+		if (m_PollingXrunLogged < 20 || (m_PollingXrunCount % 1000) == 0)
+		{
+			++m_PollingXrunLogged;
+			rslog::info_ts() << m_AsioDevice.GetIdRef() << " polling FIFO overflow (game not reading input fast enough, total: " << std::dec << m_PollingXrunCount << ")" << std::endl;
+		}
+	}
+	m_PollingFifo.Write(m_frontBuffer.data(), m_bufferNumFrames);
 }

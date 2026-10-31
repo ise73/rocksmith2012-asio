@@ -21,6 +21,20 @@ HRESULT STDMETHODCALLTYPE RSAsioAudioRenderClient::GetBuffer(UINT32 NumFramesReq
 	if (m_WaitingForBufferRelease)
 		return AUDCLNT_E_OUT_OF_ORDER;
 
+	if (m_AsioAudioClient.IsPollingFifoMode())
+	{
+		BYTE* buf = m_AsioAudioClient.PollingGetRenderBuffer(NumFramesRequested);
+		if (!buf)
+		{
+			*ppData = nullptr;
+			return AUDCLNT_E_BUFFER_TOO_LARGE;
+		}
+		*ppData = buf;
+		m_PollingFramesRequested = NumFramesRequested;
+		m_WaitingForBufferRelease = true;
+		return S_OK;
+	}
+
 	if (NumFramesRequested != m_AsioAudioClient.GetBufferNumFrames())
 		return AUDCLNT_E_BUFFER_SIZE_ERROR;
 
@@ -49,6 +63,16 @@ HRESULT STDMETHODCALLTYPE RSAsioAudioRenderClient::ReleaseBuffer(UINT32 NumFrame
 
 	if (!m_WaitingForBufferRelease)
 		return AUDCLNT_E_OUT_OF_ORDER;
+
+	if (m_AsioAudioClient.IsPollingFifoMode())
+	{
+		if (NumFramesWritten > m_PollingFramesRequested)
+			return AUDCLNT_E_INVALID_SIZE;
+
+		m_WaitingForBufferRelease = false;
+		m_AsioAudioClient.PollingCommitRender(NumFramesWritten, (dwFlags & AUDCLNT_BUFFERFLAGS_SILENT) != 0);
+		return S_OK;
+	}
 
 	const DWORD expectedNumFrames = m_AsioAudioClient.GetBufferNumFrames();
 

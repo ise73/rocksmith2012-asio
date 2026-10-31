@@ -21,6 +21,37 @@ HRESULT STDMETHODCALLTYPE RSAsioAudioCaptureClient::GetBuffer(BYTE **ppData, UIN
 	if (m_WaitingForBufferRelease)
 		return AUDCLNT_E_OUT_OF_ORDER;
 
+	if (m_AsioAudioClient.IsPollingFifoMode())
+	{
+		bool isDiscontinuity = false;
+		BYTE* data = nullptr;
+		const UINT32 numFrames = m_AsioAudioClient.PollingReadCapture(&data, &isDiscontinuity);
+
+		*ppData = data;
+		*pNumFramesToRead = numFrames;
+
+		DWORD dwOutFlags = 0;
+		if (!data)
+			dwOutFlags |= AUDCLNT_BUFFERFLAGS_SILENT;
+		if (isDiscontinuity)
+			dwOutFlags |= AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;
+		*pdwFlags = dwOutFlags;
+
+		if (pu64DevicePosition)
+		{
+			*pu64DevicePosition = 0;
+		}
+		if (pu64QPCPosition)
+		{
+			LARGE_INTEGER li;
+			*pu64QPCPosition = QueryPerformanceCounter(&li) ? (UINT64)li.QuadPart : 0;
+		}
+
+		// keep the same contract as the non-FIFO path: the game always calls ReleaseBuffer
+		m_WaitingForBufferRelease = true;
+		return S_OK;
+	}
+
 	// put the newest input data on the backbuffer
 	m_AsioAudioClient.SwapBuffers();
 
@@ -80,6 +111,12 @@ HRESULT STDMETHODCALLTYPE RSAsioAudioCaptureClient::GetNextPacketSize(UINT32 *pN
 
 	if (!pNumFramesInNextPacket)
 		return E_POINTER;
+
+	if (m_AsioAudioClient.IsPollingFifoMode())
+	{
+		*pNumFramesInNextPacket = m_AsioAudioClient.PollingGetNextCapturePacketSize();
+		return S_OK;
+	}
 
 	*pNumFramesInNextPacket = m_AsioAudioClient.GetBufferNumFrames();
 

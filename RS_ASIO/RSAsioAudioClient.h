@@ -3,6 +3,7 @@
 #include "ComBaseUnknown.h"
 #include "AsioSharedHost.h"
 #include "MyUnknown.h"
+#include "PcmFifo.h"
 
 class AsioSharedHost;
 class RSAsioDevice;
@@ -49,11 +50,23 @@ public:
 	DWORD GetBufferNumFrames() const { return m_bufferNumFrames; }
 	void SwapBuffers();
 
+	// Polling mode (no AUDCLNT_STREAMFLAGS_EVENTCALLBACK, used by Rocksmith 2011):
+	// game-side data goes through a FIFO so the ASIO buffer can be smaller than the game's polling period.
+	bool IsPollingFifoMode() const { return m_PollingFifoMode; }
+	UINT32 PollingGetBufferFrames() const { return m_PollingBufferFrames; }
+	UINT32 PollingGetPadding();
+	BYTE* PollingGetRenderBuffer(UINT32 numFrames);
+	void PollingCommitRender(UINT32 numFrames, bool silent);
+	UINT32 PollingReadCapture(BYTE** ppData, bool* outDiscontinuity);
+	UINT32 PollingGetNextCapturePacketSize();
+
 protected:
 	virtual void OnAsioBufferSwitch(unsigned buffIdx) override;
 
 private:
 	void UpdateChannelMap();
+	void PollingOnAsioBufferSwitch_Output();
+	void PollingOnAsioBufferSwitch_Input();
 
 	RSAsioDevice& m_AsioDevice;
 	AsioSharedHost& m_AsioSharedHost;
@@ -86,4 +99,13 @@ private:
 
 	// this is used for ... hacks
 	MyUnknown* m_MyUnknown = nullptr;
+
+	// polling mode FIFO state (protected by m_bufferMutex)
+	bool m_PollingFifoMode = false;
+	UINT32 m_PollingBufferFrames = 0;
+	PcmFifo m_PollingFifo;
+	std::vector<BYTE> m_PollingPacket; // staging buffer handed to the game in GetBuffer
+	bool m_PollingCaptureOverflow = false;
+	unsigned m_PollingXrunCount = 0;
+	unsigned m_PollingXrunLogged = 0;
 };

@@ -21,6 +21,8 @@ public:
 		unsigned numAsioChannels = 1;
 		BufferSizeMode bufferSizeMode = BufferSizeMode_Driver;
 		unsigned customBufferSize = 128;
+		bool enablePollingRingBuffer = true;
+		unsigned pollingBufferSize = 0; // 0 = automatic
 		bool enableSoftwareEndpointVolmeControl = true;
 		bool enableSoftwareMasterVolumeControl = true;
 		bool isMicrophone = false;

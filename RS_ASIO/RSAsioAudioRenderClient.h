@@ -14,6 +14,7 @@ public:
 
 private:
 	bool m_WaitingForBufferRelease = false;
+	UINT32 m_PollingFramesRequested = 0;
 
 	std::mutex m_mutex;
 };

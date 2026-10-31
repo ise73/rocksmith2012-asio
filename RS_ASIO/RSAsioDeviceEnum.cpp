@@ -114,6 +114,8 @@ void RSAsioDeviceEnum::UpdateAvailableDevices()
 			config.numAsioChannels = m_Config.output.numChannels;
 			config.bufferSizeMode = m_Config.bufferMode;
 			config.customBufferSize = m_Config.customBufferSize;
+			config.enablePollingRingBuffer = m_Config.enablePollingRingBuffer;
+			config.pollingBufferSize = m_Config.pollingBufferSize;
 			config.enableSoftwareEndpointVolmeControl = m_Config.output.enableSoftwareEndpointVolumeControl;
 			config.enableSoftwareMasterVolumeControl = m_Config.output.enableSoftwareMasterVolumeControl;
 			config.enableRefCountHack = m_Config.output.enableRefCountHack;
@@ -154,6 +156,8 @@ void RSAsioDeviceEnum::UpdateAvailableDevices()
 				config.numAsioChannels = 1;
 				config.bufferSizeMode = m_Config.bufferMode;
 				config.customBufferSize = m_Config.customBufferSize;
+				config.enablePollingRingBuffer = m_Config.enablePollingRingBuffer;
+				config.pollingBufferSize = m_Config.pollingBufferSize;
 				config.enableSoftwareEndpointVolmeControl = inputCfg.enableSoftwareEndpointVolumeControl;
 				config.enableSoftwareMasterVolumeControl = inputCfg.enableSoftwareMasterVolumeControl;
 				config.isMicrophone = inputCfg.microphone;

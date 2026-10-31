@@ -336,6 +336,26 @@ static void LoadConfigIni(RSConfig& out)
 							rslog::error_ts() << __FUNCTION__ << " - invalid value for buffer size, value should be an integer starting at 1. line: " << line << std::endl;
 						}
 					}
+					else if (key == "enablepollingringbuffer")
+					{
+						parseBoolString(val, out.asioConfig.enablePollingRingBuffer);
+					}
+					else if (key == "pollingbuffersize")
+					{
+						int s = 0;
+						if (val.empty())
+						{
+							out.asioConfig.pollingBufferSize = 0;
+						}
+						else if (parseIntString(val, s) && s >= 0)
+						{
+							out.asioConfig.pollingBufferSize = (unsigned)s;
+						}
+						else
+						{
+							rslog::error_ts() << __FUNCTION__ << " - invalid value for polling buffer size, value should be 0 (automatic) or a number of frames. line: " << line << std::endl;
+						}
+					}
 				}
 				else if (currentSection == SectionAsioOut)
 				{
