@@ -3,8 +3,44 @@
 #include "RSAsioDevice.h"
 #include "AsioHelpers.h"
 #include "AsioSharedHost.h"
+#include <setupapi.h>
+
+#pragma comment(lib, "setupapi.lib")
 
 bool g_EmulateRealToneCable = false;
+
+// True if a real Real Tone Cable (USB VID_12BA:PID_00FF) is currently plugged in.
+// Uses SetupAPI directly from this DLL, so the game's hooked IAT entries are not involved.
+static bool IsRealToneCableConnected()
+{
+	static const GUID kKsCategoryAudio = { 0x6994AD04, 0x93EF, 0x11D0, { 0xA3, 0xCC, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96 } };
+
+	HDEVINFO set = SetupDiGetClassDevsW(&kKsCategoryAudio, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+	if (set == INVALID_HANDLE_VALUE)
+		return false;
+
+	bool found = false;
+	std::vector<BYTE> buf(2048);
+	for (DWORD i = 0; !found; ++i)
+	{
+		SP_DEVICE_INTERFACE_DATA ifd{};
+		ifd.cbSize = sizeof(ifd);
+		if (!SetupDiEnumDeviceInterfaces(set, nullptr, &kKsCategoryAudio, i, &ifd))
+			break;
+
+		auto* detail = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(buf.data());
+		detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+		if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, detail, (DWORD)buf.size(), nullptr, nullptr))
+		{
+			std::wstring p(detail->DevicePath);
+			std::transform(p.begin(), p.end(), p.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
+			found = p.find(L"vid_12ba&pid_00ff") != std::wstring::npos;
+		}
+	}
+
+	SetupDiDestroyDeviceInfoList(set);
+	return found;
+}
 
 // ---------------------------------------------------------------------------
 // WASAPI device ID → ASIO-backed IMMDevice redirect registry
@@ -163,11 +199,22 @@ void RSAsioDeviceEnum::UpdateAvailableDevices()
 				config.enableSoftwareEndpointVolmeControl = inputCfg.enableSoftwareEndpointVolumeControl;
 				config.enableSoftwareMasterVolumeControl = inputCfg.enableSoftwareMasterVolumeControl;
 				config.isMicrophone = inputCfg.microphone;
-				config.emulateRealToneCable = inputCfg.emulateRealToneCable;
+				config.emulateRealToneCable = false;
 				if (inputCfg.emulateRealToneCable)
 				{
-					g_EmulateRealToneCable = true;
-					rslog::info_ts() << __FUNCTION__ << " - input[" << inputIdx << "] will be presented to the game as a Real Tone Cable" << std::endl;
+					// A real cable plus an emulated one makes the game complain about too many
+					// instruments, so emulation only kicks in when no real cable is plugged in.
+					static const bool realCableConnected = IsRealToneCableConnected();
+					if (realCableConnected)
+					{
+						rslog::info_ts() << __FUNCTION__ << " - input[" << inputIdx << "] EmulateRealToneCable ignored: a real Real Tone Cable is connected" << std::endl;
+					}
+					else
+					{
+						config.emulateRealToneCable = true;
+						g_EmulateRealToneCable = true;
+						rslog::info_ts() << __FUNCTION__ << " - input[" << inputIdx << "] will be presented to the game as a Real Tone Cable" << std::endl;
+					}
 				}
 				config.enableRefCountHack = inputCfg.enableRefCountHack;
 
