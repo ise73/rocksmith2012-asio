@@ -2,7 +2,7 @@
 
 ## Move to PipeWire + PipeASIO
 
-From version 0.7.5, the recommended setup moved from WineASIO/JACK to **PipeWire + PipeASIO**. On a current Arch-based system (e.g. CachyOS) with a current Wine/Proton build, this combination is simpler to maintain: PipeASIO builds against current SysWOW64 support, needs no separate JACK server, and its registration/setup steps are more reliable than WineASIO's on recent Wine versions. See the [README](../README.md) and the [setup guide](setup-guide.md) for the full rationale and installation steps.
+From version 0.7.5, the recommended setup moved from WineASIO/JACK to **PipeWire + PipeASIO**. On a current Arch-based system (e.g. CachyOS) with a current Wine/Proton build, this combination is simpler to maintain: PipeASIO builds against current SysWOW64 support, needs no separate JACK server, and its registration/setup steps are more reliable than WineASIO's on recent Wine versions. See the [README](../README.md#linux-protonwine) and the [setup guide](setup-guide.md) for the full rationale and installation steps.
 
 WineASIO remains supported as a driver option (`Driver=wineasio-rsasio` in `RS_ASIO.ini`) for systems that are already JACK-centric, but PipeASIO is the default going forward.
 

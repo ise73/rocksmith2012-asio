@@ -43,12 +43,13 @@ jobs:
         copy "bin\Win32\${{ env.BUILD_CONFIGURATION }}\RS_ASIO.dll" "$stagingName\"
         copy "bin\Win32\${{ env.BUILD_CONFIGURATION }}\avrt.dll" "$stagingName\"
         copy "assets\RS_ASIO.ini" "$stagingName\"
-        copy "LICENSE" "$stagingName\"
         copy "README.md" "$stagingName\"
-        copy "docs\README.md" "$stagingName\README-linux.md"
-        if (Test-Path "assets\RS_ASIO-windows.ini") { copy "assets\RS_ASIO-windows.ini" "$stagingName\" }
-        if (Test-Path "assets\rocksmith-on-linux.sh") { copy "assets\rocksmith-on-linux.sh" "$stagingName\" }
-        if (Test-Path "docs\setup-guide.md") { copy "docs\setup-guide.md" "$stagingName\" }
+        copy "LICENSE" "$stagingName\"
+        mkdir "$stagingName\linux"
+        copy "assets\RS_ASIO-linux.ini" "$stagingName\linux\RS_ASIO.ini"
+        copy "assets\rocksmith-on-linux.sh" "$stagingName\linux\"
+        copy "assets\pipeasio-register" "$stagingName\linux\"
+        copy "docs\setup-guide.md" "$stagingName\linux\"
         "STAGING_NAME=$stagingName" | Out-File -FilePath $env:GITHUB_ENV -Append
 
     - name: Upload build artifact
