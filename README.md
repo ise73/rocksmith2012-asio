@@ -1,6 +1,6 @@
-# Rocksmith (2011) ASIO — no Real Tone Cable needed
+# Rocksmith (2012) ASIO — no Real Tone Cable needed
 
-An ASIO patch for Ubisoft's original **Rocksmith** (2011/2012, Steam version).
+An ASIO patch for Ubisoft's original **Rocksmith** (2012, Steam version).
 It lets the game use any ASIO audio interface for both guitar input and game audio output,
 **with or without the Real Tone Cable**, and with much lower latency than the stock setup.
 
@@ -17,7 +17,7 @@ Runs on **Windows** natively and on **Linux** through Proton/Wine (see [Linux](#
 - [What it does](#what-it-does)
 - [Installation (Windows)](#installation-windows)
 - [Configuring your audio interface](#configuring-your-audio-interface)
-- [Rocksmith 2011 specific settings](#rocksmith-2011-specific-settings)
+- [Rocksmith 2012 specific settings](#rocksmith-2012-specific-settings)
 - [Reducing latency](#reducing-latency)
 - [Troubleshooting](#troubleshooting)
 - [Linux (Proton/Wine)](#linux-protonwine)
@@ -31,7 +31,7 @@ Runs on **Windows** natively and on **Linux** through Proton/Wine (see [Linux](#
 - **No cable:** with `EmulateRealToneCable=1` the ASIO input is presented to the game as a
   Real Tone Cable. If a real cable is plugged in, emulation switches itself off and the
   cable is redirected to your ASIO input instead.
-- **Low latency:** Rocksmith 2011 polls the audio device about every 10 ms instead of waiting
+- **Low latency:** Rocksmith 2012 polls the audio device about every 10 ms instead of waiting
   for it. A ring buffer between the game and ASIO lets the driver run with small buffers
   (128–256 samples) without crackling.
 
@@ -64,9 +64,9 @@ RS ASIO's documentation covers the general setup in detail and is the place to l
 - [Known issues](https://github.com/mdias/rs_asio#known-issues) — driver-specific quirks
   (Focusrite buffer sizes, missing 32-bit drivers, ASIO4ALL, …) apply here as well.
 
-Those examples are written for *Rocksmith 2014*. To use one with Rocksmith 2011, change it like this:
+Those examples are written for *Rocksmith 2014*. To use one with Rocksmith 2012, change it like this:
 
-1. **`[Config]`**: set `EnableWasapiInputs=1` (Rocksmith 2011 needs it; 2014 examples use `0`).
+1. **`[Config]`**: set `EnableWasapiInputs=1` (Rocksmith 2012 needs it; 2014 examples use `0`).
 2. **Guitar input goes in `[Asio.Input.0]`**: many 2014 examples leave `[Asio.Input.0]` empty
    (`;Driver=`) and put the guitar in `[Asio.Input.1]`. Move the `Driver=` and `Channel=` of the
    guitar input to `[Asio.Input.0]`.
@@ -118,7 +118,7 @@ Driver buffer size (Yamaha Steinberg USB Driver control panel): 128.
 
 If you get your interface working, please open an issue with your `RS_ASIO.ini` so it can be listed here.
 
-## Rocksmith 2011 specific settings
+## Rocksmith 2012 specific settings
 
 | Section | Key | Default | Meaning |
 |---|---|---|---|
@@ -198,7 +198,7 @@ More details, including the Wine-specific parts: [docs/tech-details.md](docs/tec
 ## Credits
 
 - [RS ASIO](https://github.com/mdias/rs_asio) — Micael Dias
-- [rocksmith-on-linux](https://github.com/ferabreu/rocksmith-on-linux) — ferabreu (Rocksmith 2011 support, Linux)
+- [rocksmith-on-linux](https://github.com/ferabreu/rocksmith-on-linux) — ferabreu (Rocksmith 2012 support, Linux)
 - Windows port, ring buffer and Real Tone Cable emulation — ise73, with Claude (Anthropic)
 
 MIT license, see [LICENSE](LICENSE).
